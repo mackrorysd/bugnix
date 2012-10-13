@@ -1,0 +1,273 @@
+#!/bin/bash
+
+# bugnix - trace debugging information about a Linux process
+#
+# Copyright (C) 2012 Cloudera, Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the ""Software""), to
+# deal in the Software without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+# sell copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED ""AS IS"", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+# CLOUDERA, INC. BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+# Except as contained in this notice, the name of Cloudera, Inc. shall not be
+# used in advertising or otherwise to promote the sale, use or other dealings
+# in this Software without prior written authorization from Cloudera, Inc.
+#
+#
+# FSF changes to this file are in the public domain.
+#
+
+help() {
+    less <<'EOF'
+Bugnix is a tool for debugging processes in UNIX-like operating systems. It is
+designed for troubleshooting deeply-nested or dynamic build systems, uses the
+proc file system heavily and currently only supports BASH on Linux.
+
+Usage:
+
+    bugnix --help (displays this message)
+    bugnix [--up | --down] [-cfeipuwx] [--env=ENV] [--target=PID]
+
+Modes of operation:
+
+    These specify a basic function of bugnix
+
+    --up (default): Stack trace of all ancestor processes.
+    --down: Trace of all descendant processes.
+
+Inclusion options:
+
+    By default, everything except the env variables and open files are shown.
+    Providing any of these options causes only those provided to be shown.
+
+    --env=ENV[,ENV...]: Print specific environment variables
+
+    -c: Command
+    -e: Environment variables (off by default)
+    -f: Open files (off by default)
+    -i: Process ID
+    -p: Parent Process ID
+    -u: User running the process
+    -w: Working Directory
+    -x: Executable file
+
+Other options:
+
+    --target=PID: Uses PID as a reference point instead of the current process.
+
+Examples:
+
+    Print a stack trace of the current process
+
+        `bugnix`
+
+    Prints the entire process tree
+
+        `bugnix --down --target=0:
+
+EOF
+}
+
+default="true"
+mode=up
+target=$$
+
+for arg in $@ ; do
+    if [[ "$arg" == *"="* ]]; then
+        if [ "${arg:0:9}" == "--target=" ] ; then
+            target=${arg:9}
+        fi
+        if [ "${arg:0:6}" == "--env=" ] ; then
+            _env="^\(\($(echo ${arg:6} | sed -e 's/,/\\)\\|\\(/g')\)\)="
+        fi
+    else
+        if [ "${arg:0:1}" == "-" ] ; then
+            if [ "${arg:1:1}" == "-" ] ; then
+                case "$arg" in
+                    --help) mode=help ;;
+                    --down) mode=down ;;
+                    --up) mode=up ;;
+                    *)
+                        echo "Unknown option: $c"
+                        exit 1
+                    ;;
+                esac
+            else
+                arg=${arg:1}
+                while test -n "$arg"; do
+                    c=${arg:0:1}
+                    case "$c" in
+                        c) _c="true" ;;
+                        e) _e="true" ;;
+                        f) _f="true" ;;
+                        i) _i="true" ;;
+                        p) _p="true" ;;
+                        u) _u="true" ;;
+                        w) _w="true" ;;
+                        x) _x="true" ;;
+                        *)
+                            echo "Unknown inclusion flag: $c"
+                            exit 1
+                        ;;
+                    esac
+                    default="false"
+                    arg=${arg:1}
+                done
+            fi
+        else
+            "Invalid param: $arg"
+            exit 1
+        fi
+    fi
+    shift
+done
+
+_c=${_c:-$default}
+_f=${_f:-"false"}
+_e=${_e:-"false"}
+_i=${_i:-$default}
+_p=${_p:-$default}
+_u=${_u:-$default}
+_w=${_w:-$default}
+_x=${_x:-$default}
+
+declare -A children
+preGetChildren() {
+    for child in `ls /proc` ; do
+        if [[ $child =~ ^[0-9]*$ ]] ; then # Child is number => is process
+            local parent=$(getParent $child)
+            if [ "$parent" != "" ] ; then
+                if [[ ${children[$parent]} ]] ; then
+                    children[$parent]="${children[$parent]} $child"
+                else
+                    children[$parent]="$child"
+                fi
+            fi
+        fi
+    done
+}
+
+getChildren() {
+    local pid=$1
+    if [[ ${children[$pid]} ]] ; then
+        echo ${children[$pid]}
+    else
+        echo ""
+    fi
+
+}
+
+getParent() {
+    local pid=$1
+    cat /proc/$pid/status 2>/dev/null | grep ^PPid | awk '{print $2}'
+}
+
+getSymlinkTarget() {
+    local file=$1
+    ls -l $file | awk '{print $11}'
+}
+
+prettyPrintEnv() {
+    local pid=$1
+    if [ -n "$3" ] ; then
+        cat /proc/$pid/environ | sed 's/\x00/\n/g' | sort | grep $3 | sed 's/=/ = /g' | sed "s/^/$2    /g"
+    else
+        cat /proc/$pid/environ | sed 's/\x00/\n/g' | sort | sed 's/=/ = /g' | sed "s/^/$2    /g"
+    fi
+}
+
+prettyPrintFds() {
+    local pid=$1
+    ls -l /proc/$pid/fd/ | awk '{print $9 "\t" $10 "\t" $11}' | sed "s/^/$2    /g"
+}
+
+process() {
+    local pid=$1
+    local indent=$2
+    local parent=$(getParent $pid)
+    local proc=/proc/$pid
+
+    if [ ! -d $proc ] ; then
+        return
+    fi
+
+    [ $_w == "true" ] && cwd=$(getSymlinkTarget $proc/cwd 2> /dev/null)
+    [ $_x == "true" ] && exe=$(getSymlinkTarget $proc/exe 2> /dev/null)
+    [ $_c == "true" ] && cmd=$(cat $proc/cmdline | sed 's/\x00/ /g')
+    [ $_u == "true" ] && user=$(stat -c %U $proc)
+
+    undent=${indent%%??}
+    echo "${undent%%??}---|"
+    [ $_i == "true" ] && echo "${indent}Process ID:  $pid"
+    [ $_p == "true" ] && echo "${indent}Parent ID:   $parent"
+    [ $_w == "true" ] && echo "${indent}Working Dir: $cwd"
+    [ $_c == "true" ] && echo "${indent}Command:     $cmd"
+    [ $_x == "true" ] && echo "${indent}Executable:  $exe"
+    [ $_u == "true" ] && echo "${indent}User:        $user"
+    if [ $_e == "true" ] ; then
+        echo "${indent}Env:" && prettyPrintEnv $pid "$indent"
+    else
+        if [ -n "$_env" ] ; then
+            echo "${indent}Env:" && prettyPrintEnv $pid "$indent" "$_env"
+        fi
+    fi
+    if [ $_f == "true" ] ; then
+        echo "${indent}Files:" && prettyPrintFds $pid "$indent"
+    fi
+
+    echo "${indent}"
+}
+
+uptrace() {
+    local pid=$1
+    local stack=${2:-0}
+    local parent=$(getParent $pid)
+    if [ -d /proc/$parent ] ; then
+        uptrace $parent
+        let stack=$?+1
+    else
+        stack=0
+    fi
+
+    local indent="    |"
+    for (( i=1; i <= $stack; i++ )) ; do
+        local indent="    ${indent}"
+    done
+    process $pid "$indent"
+    return $stack
+}
+
+downtrace() {
+    local pid=$1
+    local indent=$2
+    process $pid "$indent"
+    for child in $(getChildren $pid) ; do
+        downtrace $child "    $indent"
+    done
+}
+
+run() {
+    case "$mode" in
+        help) help ;;
+        up) uptrace $target;;
+        down)
+            preGetChildren
+            downtrace $target "    |"
+        ;;
+    esac
+}
+
+run
+
